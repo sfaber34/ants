@@ -19,22 +19,24 @@ interface Position {
 interface Ant {
   id: number;
   pos: Position;
+  prevPos: Position; // For smooth interpolation
   state: AntState;
   carriedInfo: "food" | "danger" | null;
-  trailHistory: Position[]; // Where the ant has been
-  trailIndex: number; // Current position in trail when backtracking
-  heading: Position; // General direction the ant is heading (for exploration)
+  trailHistory: Position[];
+  trailIndex: number;
+  heading: Position;
   isAlive: boolean;
   ticksSinceSpawn: number;
+  color: string; // Unique color for each ant's trail
 }
 
 interface Tile {
   type: TileType;
-  homePheromone: number; // Strength 0-1
-  foodPheromone: number; // Strength 0-1
-  revealed: boolean; // Has the player learned about this tile?
-  hasTrail: boolean; // Is there a visible trail here?
-  trailStrength: number; // How strong is the trail?
+  homePheromone: number;
+  foodPheromone: number;
+  revealed: boolean;
+  hasTrail: boolean;
+  trailStrength: number;
 }
 
 interface GameState {
@@ -56,20 +58,38 @@ interface GameState {
 // ============================================
 
 const MAP_SIZE = 20;
-const PHEROMONE_DECAY = 0.005; // Much slower decay
-const TRAIL_DECAY = 0.003; // Much slower trail fade
+const TILE_SIZE = 32; // Pixels per tile
+const CANVAS_SIZE = MAP_SIZE * TILE_SIZE;
+const PHEROMONE_DECAY = 0.005;
+const TRAIL_DECAY = 0.003;
 const MAX_ANTS = 15;
 const INITIAL_ANTS = 2;
-const INITIAL_FOOD = 5; // Lower starting food so we don't auto-spawn ants
+const INITIAL_FOOD = 5;
 const WIN_FOOD = 30;
 const STARVATION_TICKS = 300;
 const MIN_ANTS_TO_SURVIVE = 1;
-const SPAWN_FOOD_COST = 5; // Higher cost to spawn new ants
-const TICK_INTERVAL = 1200; // ms - slower so you can watch
+const SPAWN_FOOD_COST = 5;
+const TICK_INTERVAL = 1200;
 
-// Map layout - true map (player doesn't see this initially)
-// 🟫 = border, . = ground, F = food, S = spider, N = nest
-// Nest is in the CENTER so ants can explore in all directions
+// Ant colors for unique trail visualization
+const ANT_COLORS = [
+  "#FF6B6B",
+  "#4ECDC4",
+  "#45B7D1",
+  "#96CEB4",
+  "#FFEAA7",
+  "#DDA0DD",
+  "#98D8C8",
+  "#F7DC6F",
+  "#BB8FCE",
+  "#85C1E9",
+  "#F8B500",
+  "#00CED1",
+  "#FF69B4",
+  "#7FFF00",
+  "#FF4500",
+];
+
 const MAP_TEMPLATE = [
   "🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫🟫",
   "🟫..............F...🟫",
@@ -113,7 +133,7 @@ const parseMapTemplate = (): { tiles: Tile[][]; nestPos: Position } => {
 
       if (char === "🟫") {
         type = "border";
-        charIndex += 2; // emoji is 2 chars
+        charIndex += 2;
       } else if (char === "F") {
         type = "food";
         charIndex += 1;
@@ -140,7 +160,6 @@ const parseMapTemplate = (): { tiles: Tile[][]; nestPos: Position } => {
       x++;
     }
 
-    // Fill remaining if needed
     while (x < MAP_SIZE) {
       tiles[y][x] = {
         type: "ground",
@@ -154,7 +173,6 @@ const parseMapTemplate = (): { tiles: Tile[][]; nestPos: Position } => {
     }
   }
 
-  // Reveal area around nest
   for (let dy = -2; dy <= 2; dy++) {
     for (let dx = -2; dx <= 2; dx++) {
       const nx = nestPos.x + dx;
@@ -169,9 +187,7 @@ const parseMapTemplate = (): { tiles: Tile[][]; nestPos: Position } => {
   return { tiles, nestPos };
 };
 
-// Generate a random heading direction (away from nest, toward edges)
 const randomHeading = (nestPos: Position): Position => {
-  // Pick a random angle and create a unit direction
   const angle = Math.random() * Math.PI * 2;
   return {
     x: Math.round(Math.cos(angle) * 10) + nestPos.x,
@@ -185,6 +201,7 @@ const createInitialAnts = (nestPos: Position, count: number, startId: number): A
     ants.push({
       id: startId + i,
       pos: { ...nestPos },
+      prevPos: { ...nestPos },
       state: "explore",
       carriedInfo: null,
       trailHistory: [{ ...nestPos }],
@@ -192,6 +209,7 @@ const createInitialAnts = (nestPos: Position, count: number, startId: number): A
       heading: randomHeading(nestPos),
       isAlive: true,
       ticksSinceSpawn: 0,
+      color: ANT_COLORS[i % ANT_COLORS.length],
     });
   }
   return ants;
@@ -217,6 +235,388 @@ const getNeighbors = (pos: Position): Position[] => {
     .filter(p => p.x >= 0 && p.x < MAP_SIZE && p.y >= 0 && p.y < MAP_SIZE);
 };
 
+// Convert grid position to canvas pixel position (center of tile)
+const toPixel = (pos: Position): { x: number; y: number } => ({
+  x: pos.x * TILE_SIZE + TILE_SIZE / 2,
+  y: pos.y * TILE_SIZE + TILE_SIZE / 2,
+});
+
+// ============================================
+// CANVAS RENDERING
+// ============================================
+
+const renderGame = (ctx: CanvasRenderingContext2D, gameState: GameState, interpolation: number) => {
+  const { map, ants, nestPos } = gameState;
+
+  // Clear canvas
+  ctx.fillStyle = "#2D1B0E";
+  ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+
+  // Draw ground tiles and borders
+  for (let y = 0; y < MAP_SIZE; y++) {
+    for (let x = 0; x < MAP_SIZE; x++) {
+      const tile = map[y][x];
+      const px = x * TILE_SIZE;
+      const py = y * TILE_SIZE;
+
+      if (tile.type === "border") {
+        // Rocky border
+        ctx.fillStyle = "#1a0f0a";
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+        // Add some texture
+        ctx.fillStyle = "#2a1f1a";
+        ctx.fillRect(px + 4, py + 4, TILE_SIZE - 8, TILE_SIZE - 8);
+      } else if (tile.revealed) {
+        // Revealed ground - lighter brown
+        ctx.fillStyle = "#5D4037";
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+      } else {
+        // Fog of war - dark
+        ctx.fillStyle = "#1E1E1E";
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+      }
+    }
+  }
+
+  // Draw subtle grid lines on revealed areas
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= MAP_SIZE; i++) {
+    ctx.beginPath();
+    ctx.moveTo(i * TILE_SIZE, 0);
+    ctx.lineTo(i * TILE_SIZE, CANVAS_SIZE);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, i * TILE_SIZE);
+    ctx.lineTo(CANVAS_SIZE, i * TILE_SIZE);
+    ctx.stroke();
+  }
+
+  // Draw food pheromone trails (heat map style)
+  for (let y = 0; y < MAP_SIZE; y++) {
+    for (let x = 0; x < MAP_SIZE; x++) {
+      const tile = map[y][x];
+      if (tile.foodPheromone > 0.05 && tile.revealed) {
+        const px = x * TILE_SIZE;
+        const py = y * TILE_SIZE;
+        const intensity = Math.min(1, tile.foodPheromone);
+
+        // Green glow for food pheromone
+        const gradient = ctx.createRadialGradient(
+          px + TILE_SIZE / 2,
+          py + TILE_SIZE / 2,
+          0,
+          px + TILE_SIZE / 2,
+          py + TILE_SIZE / 2,
+          TILE_SIZE * 0.7,
+        );
+        gradient.addColorStop(0, `rgba(76, 175, 80, ${intensity * 0.6})`);
+        gradient.addColorStop(1, `rgba(76, 175, 80, 0)`);
+        ctx.fillStyle = gradient;
+        ctx.fillRect(px - 4, py - 4, TILE_SIZE + 8, TILE_SIZE + 8);
+      }
+    }
+  }
+
+  // Draw ant trails as continuous lines
+  const aliveAnts = ants.filter(a => a.isAlive);
+
+  for (const ant of aliveAnts) {
+    if (ant.trailHistory.length < 2) continue;
+
+    ctx.beginPath();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    const trail = ant.trailHistory;
+    const startPixel = toPixel(trail[0]);
+    ctx.moveTo(startPixel.x, startPixel.y);
+
+    // Draw trail with gradient opacity (older = more transparent)
+    for (let i = 1; i < trail.length; i++) {
+      const pixel = toPixel(trail[i]);
+
+      // Calculate opacity based on position in trail (newer = brighter)
+      const progress = i / trail.length;
+      const alpha = 0.1 + progress * 0.5;
+
+      // Different colors based on ant state
+      let trailColor = ant.color;
+      if (ant.carriedInfo === "food") {
+        trailColor = "#4CAF50"; // Green when carrying food
+      }
+
+      ctx.strokeStyle = trailColor.replace(")", `, ${alpha})`).replace("rgb", "rgba").replace("#", "");
+      // Convert hex to rgba
+      if (trailColor.startsWith("#")) {
+        const r = parseInt(trailColor.slice(1, 3), 16);
+        const g = parseInt(trailColor.slice(3, 5), 16);
+        const b = parseInt(trailColor.slice(5, 7), 16);
+        ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      }
+
+      ctx.lineWidth = 2 + progress * 3;
+      ctx.lineTo(pixel.x, pixel.y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(pixel.x, pixel.y);
+    }
+  }
+
+  // Draw white trails on unrevealed tiles (scouting trails)
+  for (let y = 0; y < MAP_SIZE; y++) {
+    for (let x = 0; x < MAP_SIZE; x++) {
+      const tile = map[y][x];
+      if (!tile.revealed && tile.hasTrail && tile.trailStrength > 0.05) {
+        const px = x * TILE_SIZE + TILE_SIZE / 2;
+        const py = y * TILE_SIZE + TILE_SIZE / 2;
+        const intensity = Math.min(1, tile.trailStrength);
+
+        // White dot for unexplored trail
+        ctx.beginPath();
+        ctx.arc(px, py, 3 + intensity * 4, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 255, 255, ${intensity * 0.6})`;
+        ctx.fill();
+      }
+    }
+  }
+
+  // Draw nest with glow effect
+  const nestPixel = toPixel(nestPos);
+
+  // Outer glow
+  const nestGlow = ctx.createRadialGradient(nestPixel.x, nestPixel.y, 0, nestPixel.x, nestPixel.y, TILE_SIZE * 2);
+  nestGlow.addColorStop(0, "rgba(139, 90, 43, 0.4)");
+  nestGlow.addColorStop(1, "rgba(139, 90, 43, 0)");
+  ctx.fillStyle = nestGlow;
+  ctx.beginPath();
+  ctx.arc(nestPixel.x, nestPixel.y, TILE_SIZE * 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Nest body
+  ctx.fillStyle = "#8B5A2B";
+  ctx.beginPath();
+  ctx.arc(nestPixel.x, nestPixel.y, TILE_SIZE * 0.6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Nest entrance
+  ctx.fillStyle = "#3E2723";
+  ctx.beginPath();
+  ctx.ellipse(nestPixel.x, nestPixel.y + 4, TILE_SIZE * 0.25, TILE_SIZE * 0.15, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Draw food sources
+  for (let y = 0; y < MAP_SIZE; y++) {
+    for (let x = 0; x < MAP_SIZE; x++) {
+      const tile = map[y][x];
+      if (tile.type === "food" && tile.revealed) {
+        const px = x * TILE_SIZE + TILE_SIZE / 2;
+        const py = y * TILE_SIZE + TILE_SIZE / 2;
+
+        // Food glow
+        ctx.shadowColor = "#4CAF50";
+        ctx.shadowBlur = 10;
+
+        // Apple shape
+        ctx.fillStyle = "#E53935";
+        ctx.beginPath();
+        ctx.arc(px, py + 2, TILE_SIZE * 0.35, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Leaf
+        ctx.fillStyle = "#4CAF50";
+        ctx.beginPath();
+        ctx.ellipse(px + 4, py - 8, 6, 3, Math.PI / 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Stem
+        ctx.strokeStyle = "#5D4037";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(px, py - 4);
+        ctx.lineTo(px + 2, py - 10);
+        ctx.stroke();
+
+        ctx.shadowBlur = 0;
+      }
+    }
+  }
+
+  // Draw spiders (danger)
+  for (let y = 0; y < MAP_SIZE; y++) {
+    for (let x = 0; x < MAP_SIZE; x++) {
+      const tile = map[y][x];
+      if (tile.type === "spider" && tile.revealed) {
+        const px = x * TILE_SIZE + TILE_SIZE / 2;
+        const py = y * TILE_SIZE + TILE_SIZE / 2;
+
+        // Danger glow
+        ctx.shadowColor = "#F44336";
+        ctx.shadowBlur = 15;
+
+        // Spider body
+        ctx.fillStyle = "#212121";
+        ctx.beginPath();
+        ctx.ellipse(px, py, TILE_SIZE * 0.3, TILE_SIZE * 0.2, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Spider head
+        ctx.beginPath();
+        ctx.arc(px + TILE_SIZE * 0.25, py, TILE_SIZE * 0.15, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Legs
+        ctx.strokeStyle = "#212121";
+        ctx.lineWidth = 2;
+        for (let i = 0; i < 4; i++) {
+          const angle = (i - 1.5) * 0.4;
+          // Left legs
+          ctx.beginPath();
+          ctx.moveTo(px - 4, py);
+          ctx.quadraticCurveTo(px - 12, py + Math.sin(angle) * 8, px - 16, py + (i - 1.5) * 6);
+          ctx.stroke();
+          // Right legs
+          ctx.beginPath();
+          ctx.moveTo(px + 4, py);
+          ctx.quadraticCurveTo(px + 12, py + Math.sin(angle) * 8, px + 16, py + (i - 1.5) * 6);
+          ctx.stroke();
+        }
+
+        // Red eyes
+        ctx.fillStyle = "#F44336";
+        ctx.beginPath();
+        ctx.arc(px + TILE_SIZE * 0.28, py - 3, 2, 0, Math.PI * 2);
+        ctx.arc(px + TILE_SIZE * 0.28, py + 3, 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.shadowBlur = 0;
+      }
+    }
+  }
+
+  // Draw ants with smooth interpolation
+  for (const ant of aliveAnts) {
+    // Interpolate position for smooth movement
+    const currentPixel = toPixel(ant.pos);
+    const prevPixel = toPixel(ant.prevPos);
+    const lerpX = prevPixel.x + (currentPixel.x - prevPixel.x) * interpolation;
+    const lerpY = prevPixel.y + (currentPixel.y - prevPixel.y) * interpolation;
+
+    // Ant shadow
+    ctx.fillStyle = "rgba(0, 0, 0, 0.3)";
+    ctx.beginPath();
+    ctx.ellipse(lerpX + 2, lerpY + 4, 8, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Ant body color based on state
+    const bodyColor = "#1a1a1a";
+    let glowColor = ant.color;
+
+    if (ant.carriedInfo === "food") {
+      glowColor = "#4CAF50";
+    }
+
+    // Glow effect
+    ctx.shadowColor = glowColor;
+    ctx.shadowBlur = 8;
+
+    // Ant body (3 segments)
+    ctx.fillStyle = bodyColor;
+
+    // Calculate heading direction for rotation
+    const dx = ant.pos.x - ant.prevPos.x;
+    const dy = ant.pos.y - ant.prevPos.y;
+    const angle = Math.atan2(dy, dx);
+
+    ctx.save();
+    ctx.translate(lerpX, lerpY);
+    ctx.rotate(angle);
+
+    // Head
+    ctx.beginPath();
+    ctx.ellipse(8, 0, 4, 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Thorax
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 5, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Abdomen
+    ctx.beginPath();
+    ctx.ellipse(-9, 0, 6, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Antennae
+    ctx.strokeStyle = bodyColor;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(10, -2);
+    ctx.quadraticCurveTo(14, -6, 16, -4);
+    ctx.moveTo(10, 2);
+    ctx.quadraticCurveTo(14, 6, 16, 4);
+    ctx.stroke();
+
+    // Legs
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 3; i++) {
+      const legX = 3 - i * 4;
+      // Top legs
+      ctx.beginPath();
+      ctx.moveTo(legX, -3);
+      ctx.quadraticCurveTo(legX + 2, -8, legX + 4, -10);
+      ctx.stroke();
+      // Bottom legs
+      ctx.beginPath();
+      ctx.moveTo(legX, 3);
+      ctx.quadraticCurveTo(legX + 2, 8, legX + 4, 10);
+      ctx.stroke();
+    }
+
+    // Food indicator (green dot on back)
+    if (ant.carriedInfo === "food") {
+      ctx.fillStyle = "#4CAF50";
+      ctx.beginPath();
+      ctx.arc(-6, 0, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+    ctx.shadowBlur = 0;
+  }
+
+  // Draw fog of war edges (softer transition)
+  for (let y = 0; y < MAP_SIZE; y++) {
+    for (let x = 0; x < MAP_SIZE; x++) {
+      const tile = map[y][x];
+      if (!tile.revealed && tile.type !== "border") {
+        // Check if adjacent to revealed tile
+        const neighbors = getNeighbors({ x, y });
+        const hasRevealedNeighbor = neighbors.some(n => map[n.y]?.[n.x]?.revealed);
+
+        if (hasRevealedNeighbor) {
+          const px = x * TILE_SIZE;
+          const py = y * TILE_SIZE;
+
+          // Soft fog edge
+          const gradient = ctx.createRadialGradient(
+            px + TILE_SIZE / 2,
+            py + TILE_SIZE / 2,
+            0,
+            px + TILE_SIZE / 2,
+            py + TILE_SIZE / 2,
+            TILE_SIZE,
+          );
+          gradient.addColorStop(0, "rgba(30, 30, 30, 0.8)");
+          gradient.addColorStop(1, "rgba(30, 30, 30, 0)");
+          ctx.fillStyle = gradient;
+          ctx.fillRect(px - TILE_SIZE / 2, py - TILE_SIZE / 2, TILE_SIZE * 2, TILE_SIZE * 2);
+        }
+      }
+    }
+  }
+};
+
 // ============================================
 // GAME COMPONENT
 // ============================================
@@ -225,7 +625,10 @@ const Home: NextPage = () => {
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [isPaused, setIsPaused] = useState(false);
   const [gameSpeed, setGameSpeed] = useState(1);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const tickRef = useRef<NodeJS.Timeout | null>(null);
+  const animationRef = useRef<number | null>(null);
+  const lastTickTime = useRef<number>(Date.now());
 
   // Initialize game
   const initGame = useCallback(() => {
@@ -246,9 +649,10 @@ const Home: NextPage = () => {
       antIdCounter: INITIAL_ANTS,
     });
     setIsPaused(false);
+    lastTickTime.current = Date.now();
   }, []);
 
-  // Game tick logic
+  // Game tick logic (unchanged from original)
   const gameTick = useCallback(() => {
     setGameState(prev => {
       if (!prev || prev.gameOver) return prev;
@@ -286,7 +690,11 @@ const Home: NextPage = () => {
       const newAnts = prev.ants
         .filter(ant => ant.isAlive)
         .map(ant => {
-          const newAnt = { ...ant, ticksSinceSpawn: ant.ticksSinceSpawn + 1 };
+          const newAnt = {
+            ...ant,
+            ticksSinceSpawn: ant.ticksSinceSpawn + 1,
+            prevPos: { ...ant.pos }, // Store previous position for interpolation
+          };
           const currentTile = newMap[ant.pos.y][ant.pos.x];
 
           // Deposit trail
@@ -296,7 +704,7 @@ const Home: NextPage = () => {
             trailStrength: Math.min(1, currentTile.trailStrength + 0.3),
           };
 
-          // If carrying food, deposit pheromone on CURRENT tile (before any state changes)
+          // If carrying food, deposit pheromone
           if (ant.carriedInfo === "food") {
             newMap[ant.pos.y][ant.pos.x].foodPheromone = Math.min(1, newMap[ant.pos.y][ant.pos.x].foodPheromone + 0.5);
           }
@@ -307,26 +715,23 @@ const Home: NextPage = () => {
             ticksSinceLastFood = 0;
             newAnt.carriedInfo = null;
 
-            // Reveal the ant's trail (the path it took)
+            // Reveal the ant's trail
             ant.trailHistory.forEach(pos => {
               newMap[pos.y][pos.x].revealed = true;
             });
 
-            // Also deposit food pheromone on the NEST itself so harvest ants can find the start
             newMap[prev.nestPos.y][prev.nestPos.x].foodPheromone = Math.min(
               1,
               newMap[prev.nestPos.y][prev.nestPos.x].foodPheromone + 0.3,
             );
 
-            // RESET trail for new journey outward
             newAnt.trailHistory = [{ ...prev.nestPos }];
             newAnt.trailIndex = 0;
 
-            // What to do next?
             if (prev.directive === "defend") {
               newAnt.state = "defend";
             } else if (prev.directive === "harvest") {
-              newAnt.state = "harvest"; // Go back out for more food!
+              newAnt.state = "harvest";
             } else {
               newAnt.state = "explore";
             }
@@ -344,19 +749,14 @@ const Home: NextPage = () => {
 
           switch (newAnt.state) {
             case "explore": {
-              // EXPLORE = move AWAY from nest, avoid own trail
               const visitedSet = new Set(ant.trailHistory.map(pos => `${pos.x},${pos.y}`));
-
-              // Find unvisited neighbors
               const unvisitedNeighbors = validNeighbors.filter(p => !visitedSet.has(`${p.x},${p.y}`));
 
               if (unvisitedNeighbors.length > 0) {
-                // We have fresh tiles to explore!
                 const weights = unvisitedNeighbors.map(p => {
                   const tile = newMap[p.y][p.x];
                   let weight = 1;
 
-                  // STRONGLY prefer moving AWAY from nest
                   const currentDistFromNest = distance(ant.pos, prev.nestPos);
                   const newDistFromNest = distance(p, prev.nestPos);
                   if (newDistFromNest > currentDistFromNest) {
@@ -365,14 +765,11 @@ const Home: NextPage = () => {
                     weight *= 0.3;
                   }
 
-                  // Prefer completely unexplored tiles
                   if (!tile.hasTrail && !tile.revealed) {
                     weight += 5;
                   }
 
-                  // Small randomness
                   weight += Math.random() * 0.5;
-
                   return weight;
                 });
 
@@ -387,11 +784,8 @@ const Home: NextPage = () => {
                 }
                 if (!targetPos) targetPos = unvisitedNeighbors[0];
               } else {
-                // STUCK! All neighbors are in our trail.
-                // Head back toward nest to reset - we've explored this area
                 newAnt.state = "return";
                 newAnt.trailIndex = newAnt.trailHistory.length - 1;
-                // Pick tile closest to nest
                 validNeighbors.sort((a, b) => distance(a, prev.nestPos) - distance(b, prev.nestPos));
                 targetPos = validNeighbors[0];
               }
@@ -399,25 +793,17 @@ const Home: NextPage = () => {
             }
 
             case "harvest": {
-              // HARVEST = follow food pheromone trail TO the food source
-              // Track where we've been to avoid bouncing
               const visitedSet = new Set(ant.trailHistory.slice(-5).map(pos => `${pos.x},${pos.y}`));
-
-              // Find neighbors with food pheromone, excluding recently visited
               const foodNeighbors = validNeighbors.filter(p => {
                 const key = `${p.x},${p.y}`;
                 return newMap[p.y][p.x].foodPheromone > 0 && !visitedSet.has(key);
               });
 
               if (foodNeighbors.length > 0) {
-                // Follow strongest food pheromone
                 foodNeighbors.sort((a, b) => newMap[b.y][b.x].foodPheromone - newMap[a.y][a.x].foodPheromone);
                 targetPos = foodNeighbors[0];
               } else {
-                // No unvisited food trail nearby
-                // Check if we're at the nest - if so, wait or explore slightly
                 if (distance(ant.pos, prev.nestPos) <= 1) {
-                  // At nest but no food trail yet - stay close, patrol near nest
                   const nearNest = validNeighbors.filter(p => distance(p, prev.nestPos) <= 2);
                   if (nearNest.length > 0) {
                     targetPos = nearNest[Math.floor(Math.random() * nearNest.length)];
@@ -425,7 +811,6 @@ const Home: NextPage = () => {
                     targetPos = validNeighbors[0];
                   }
                 } else {
-                  // Not at nest and no food trail - HEAD BACK TO NEST to find the trail
                   validNeighbors.sort((a, b) => distance(a, prev.nestPos) - distance(b, prev.nestPos));
                   targetPos = validNeighbors[0];
                 }
@@ -434,19 +819,12 @@ const Home: NextPage = () => {
             }
 
             case "return": {
-              // RETURN = head back to nest, following our trail
-              // (Food pheromone is deposited at the start of tick processing)
-
-              // Check if we've reached nest (for ants NOT carrying food, e.g. stuck explorers)
               if (distance(ant.pos, prev.nestPos) <= 1 && newAnt.carriedInfo === null) {
-                // Reset and go back to exploring or whatever directive says
                 newAnt.trailHistory = [{ ...prev.nestPos }];
                 newAnt.trailIndex = 0;
                 newAnt.state = prev.directive;
-                // Stay at nest this tick
                 targetPos = null;
               } else {
-                // Backtrack along our trail
                 if (newAnt.trailIndex > 0) {
                   const backtrackTarget = newAnt.trailHistory[newAnt.trailIndex - 1];
                   const canBacktrack = validNeighbors.some(p => p.x === backtrackTarget.x && p.y === backtrackTarget.y);
@@ -456,24 +834,18 @@ const Home: NextPage = () => {
                   }
                 }
 
-                // Fallback: direct navigation toward nest
                 if (!targetPos) {
                   validNeighbors.sort((a, b) => distance(a, prev.nestPos) - distance(b, prev.nestPos));
                   targetPos = validNeighbors[0];
                 }
               }
-
-              // Note: Food delivery is handled above
               break;
             }
 
             case "defend": {
-              // DEFEND = head straight back to nest, then patrol nearby
               const distToNest = distance(ant.pos, prev.nestPos);
 
               if (distToNest > 2) {
-                // Not at nest yet - head home!
-                // First try: follow our trail if we have one
                 if (newAnt.trailIndex > 0) {
                   const backtrackTarget = newAnt.trailHistory[newAnt.trailIndex - 1];
                   const canBacktrack = validNeighbors.some(p => p.x === backtrackTarget.x && p.y === backtrackTarget.y);
@@ -483,20 +855,17 @@ const Home: NextPage = () => {
                   }
                 }
 
-                // Fallback: just pick the tile CLOSEST to nest (direct navigation)
                 if (!targetPos) {
                   validNeighbors.sort((a, b) => distance(a, prev.nestPos) - distance(b, prev.nestPos));
                   targetPos = validNeighbors[0];
                 }
               } else {
-                // At nest - patrol nearby (stay within 2 tiles)
                 const nearNest = validNeighbors.filter(p => distance(p, prev.nestPos) <= 2);
                 if (nearNest.length > 0) {
                   targetPos = nearNest[Math.floor(Math.random() * nearNest.length)];
                 } else {
                   targetPos = validNeighbors[0];
                 }
-                // Reset trail since we're home
                 newAnt.trailHistory = [{ ...prev.nestPos }];
                 newAnt.trailIndex = 0;
               }
@@ -507,14 +876,11 @@ const Home: NextPage = () => {
           if (targetPos) {
             newAnt.pos = targetPos;
 
-            // ONLY add to trail when going OUT (explore or harvest)
-            // NOT when returning - we need stable indices for backtracking
             const isGoingOut = newAnt.state === "explore" || newAnt.state === "harvest";
             if (isGoingOut) {
               newAnt.trailHistory.push({ ...targetPos });
-              newAnt.trailIndex = newAnt.trailHistory.length - 1; // Keep index at end
+              newAnt.trailIndex = newAnt.trailHistory.length - 1;
 
-              // Limit trail history
               if (newAnt.trailHistory.length > 100) {
                 newAnt.trailHistory = newAnt.trailHistory.slice(-100);
                 newAnt.trailIndex = newAnt.trailHistory.length - 1;
@@ -523,22 +889,17 @@ const Home: NextPage = () => {
 
             const newTile = newMap[targetPos.y][targetPos.x];
 
-            // Check for spider - instant death, no notification
             if (newTile.type === "spider") {
               newAnt.isAlive = false;
               return newAnt;
             }
 
-            // Check for food - only pick up if in explore or harvest mode
             if (newTile.type === "food" && newAnt.carriedInfo === null && isGoingOut) {
               newAnt.carriedInfo = "food";
               newAnt.state = "return";
-              // trailIndex already points to current position (food location)
-              // Mark strong food pheromone at food source
               newMap[targetPos.y][targetPos.x].foodPheromone = 1;
             }
 
-            // If carrying food and returning, deposit food pheromone on EVERY tile we move through
             if (newAnt.carriedInfo === "food" && newAnt.state === "return") {
               newMap[targetPos.y][targetPos.x].foodPheromone = Math.min(
                 1,
@@ -546,7 +907,6 @@ const Home: NextPage = () => {
               );
             }
 
-            // Deposit home pheromone on explored tiles (helps others find way back)
             newMap[targetPos.y][targetPos.x].homePheromone = Math.max(
               newMap[targetPos.y][targetPos.x].homePheromone,
               newMap[ant.pos.y]?.[ant.pos.x]?.homePheromone * 0.9 || 0,
@@ -556,13 +916,14 @@ const Home: NextPage = () => {
           return newAnt;
         });
 
-      // Spawn new ants if we have enough food
+      // Spawn new ants
       const aliveAnts = newAnts.filter(a => a.isAlive);
       if (newFood >= SPAWN_FOOD_COST && aliveAnts.length < MAX_ANTS) {
         newFood -= SPAWN_FOOD_COST;
         newAntsToSpawn.push({
           id: antIdCounter,
           pos: { ...prev.nestPos },
+          prevPos: { ...prev.nestPos },
           state: prev.directive === "defend" ? "defend" : "explore",
           carriedInfo: null,
           trailHistory: [{ ...prev.nestPos }],
@@ -570,6 +931,7 @@ const Home: NextPage = () => {
           heading: randomHeading(prev.nestPos),
           isAlive: true,
           ticksSinceSpawn: 0,
+          color: ANT_COLORS[antIdCounter % ANT_COLORS.length],
         });
         antIdCounter++;
       }
@@ -577,7 +939,6 @@ const Home: NextPage = () => {
       const allAnts = [...newAnts, ...newAntsToSpawn];
       const finalAliveAnts = allAnts.filter(a => a.isAlive);
 
-      // Check win/lose conditions
       let gameOver = false;
       let won = false;
 
@@ -591,6 +952,8 @@ const Home: NextPage = () => {
         gameOver = true;
         won = false;
       }
+
+      lastTickTime.current = Date.now();
 
       return {
         ...prev,
@@ -606,6 +969,33 @@ const Home: NextPage = () => {
     });
   }, []);
 
+  // Canvas render loop
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !gameState) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const render = () => {
+      // Calculate interpolation for smooth movement
+      const timeSinceLastTick = Date.now() - lastTickTime.current;
+      const tickDuration = TICK_INTERVAL / gameSpeed;
+      const interpolation = isPaused ? 1 : Math.min(1, timeSinceLastTick / tickDuration);
+
+      renderGame(ctx, gameState, interpolation);
+      animationRef.current = requestAnimationFrame(render);
+    };
+
+    render();
+
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [gameState, isPaused, gameSpeed]);
+
   // Start game loop
   useEffect(() => {
     initGame();
@@ -618,7 +1008,6 @@ const Home: NextPage = () => {
     return () => {
       if (tickRef.current) clearInterval(tickRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameState?.gameOver, isPaused, gameSpeed, gameTick]);
 
   const setDirective = (directive: GlobalDirective) => {
@@ -635,70 +1024,10 @@ const Home: NextPage = () => {
     });
   };
 
-  // Render tile as a colored element
-  // Returns { content, bgColor, textColor }
-  const getTileDisplay = (
-    tile: Tile,
-    x: number,
-    y: number,
-    ants: Ant[],
-    nestPos: Position,
-  ): { content: string; bgColor: string; textColor?: string } => {
-    const antsHere = ants.filter(a => a.isAlive && a.pos.x === x && a.pos.y === y);
-    const isNest = x === nestPos.x && y === nestPos.y;
-
-    // Nest
-    if (isNest) return { content: "🏠", bgColor: "#5d4037" };
-
-    // Ants are ALWAYS visible
-    if (antsHere.length > 0) {
-      // Show ant on appropriate background
-      const bgColor = tile.revealed
-        ? tile.foodPheromone > 0.1
-          ? "#2e7d32" // Green if on food trail
-          : "#8d6e63" // Light brown if explored
-        : tile.hasTrail
-          ? "#78909c" // Gray-blue if on trail in fog
-          : "#4e342e"; // Dark brown if in fog
-      return { content: "🐜", bgColor };
-    }
-
-    // Border
-    if (tile.type === "border") return { content: "", bgColor: "#3e2723" };
-
-    // REVEALED tiles (ant made it back with info)
-    if (tile.revealed) {
-      if (tile.type === "food") return { content: "🍎", bgColor: "#33691e" };
-      if (tile.type === "spider") return { content: "☠️", bgColor: "#b71c1c" };
-      // Food pheromone trail (green - known food route)
-      if (tile.foodPheromone > 0.1) {
-        const intensity = Math.min(1, tile.foodPheromone);
-        return {
-          content: "",
-          bgColor: `rgba(46, 125, 50, ${0.3 + intensity * 0.5})`,
-        };
-      }
-      // Regular explored ground
-      return { content: "", bgColor: "#a1887f" };
-    }
-
-    // UNREVEALED with trail (white outgoing trail)
-    if (tile.hasTrail && tile.trailStrength > 0.05) {
-      const intensity = Math.min(1, tile.trailStrength);
-      return {
-        content: "",
-        bgColor: `rgba(255, 255, 255, ${0.2 + intensity * 0.4})`,
-      };
-    }
-
-    // Complete fog - flat brown
-    return { content: "", bgColor: "#4e342e" };
-  };
-
   if (!gameState) {
     return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="text-2xl">Loading...</div>
+      <div className="flex items-center justify-center min-h-screen bg-stone-900">
+        <div className="text-2xl text-amber-200">Loading...</div>
       </div>
     );
   }
@@ -706,20 +1035,19 @@ const Home: NextPage = () => {
   const aliveAnts = gameState.ants.filter(a => a.isAlive);
 
   return (
-    <div className="flex flex-col items-center min-h-screen bg-gradient-to-b from-amber-900 via-amber-800 to-stone-900 text-white p-4">
+    <div className="flex flex-col items-center min-h-screen bg-gradient-to-b from-stone-900 via-stone-800 to-stone-900 text-white p-4">
       {/* Header */}
       <div className="text-center mb-4">
         <h1 className="text-4xl font-bold mb-2 text-amber-200" style={{ fontFamily: "serif" }}>
           🐜 Ant Colony 🐜
         </h1>
         <p className="text-amber-100/80 text-sm max-w-md">
-          Guide your colony through pheromone directives. You won&apos;t know what&apos;s out there until your ants
-          report back...
+          Guide your colony through pheromone directives. Watch your ants explore the unknown...
         </p>
       </div>
 
       {/* Stats Bar */}
-      <div className="flex gap-6 mb-4 bg-stone-800/50 rounded-lg px-6 py-3">
+      <div className="flex gap-6 mb-4 bg-stone-800/80 rounded-lg px-6 py-3 border border-stone-700">
         <div className="text-center">
           <div className="text-2xl font-bold text-green-400">
             {gameState.food}/{WIN_FOOD}
@@ -745,7 +1073,7 @@ const Home: NextPage = () => {
       {/* Game Over Screen */}
       {gameState.gameOver && (
         <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-50">
-          <div className="bg-stone-800 rounded-xl p-8 text-center">
+          <div className="bg-stone-800 rounded-xl p-8 text-center border border-stone-600">
             <h2 className={`text-4xl font-bold mb-4 ${gameState.won ? "text-green-400" : "text-red-400"}`}>
               {gameState.won ? "🎉 VICTORY! 🎉" : "💀 COLONY LOST 💀"}
             </h2>
@@ -792,43 +1120,18 @@ const Home: NextPage = () => {
         {gameState.directive === "defend" && "Ants return to nest and patrol nearby. Safe, but no new food."}
       </div>
 
-      {/* Game Board */}
-      <div
-        className="rounded-lg p-1 shadow-2xl border border-amber-900/50"
-        style={{
-          backgroundColor: "#3e2723",
-          display: "grid",
-          gridTemplateColumns: `repeat(${MAP_SIZE}, 1fr)`,
-          gap: "1px",
-        }}
-      >
-        {gameState.map.map((row, y) =>
-          row.map((tile, x) => {
-            const display = getTileDisplay(tile, x, y, gameState.ants, gameState.nestPos);
-            return (
-              <div
-                key={`${x}-${y}`}
-                className="flex items-center justify-center"
-                style={{
-                  width: "clamp(14px, 2vw, 22px)",
-                  height: "clamp(14px, 2vw, 22px)",
-                  backgroundColor: display.bgColor,
-                  fontSize: "clamp(10px, 1.5vw, 14px)",
-                  transition: "background-color 0.3s ease",
-                }}
-                title={
-                  tile.revealed
-                    ? `(${x},${y}) ${tile.type} | Trail: ${tile.trailStrength.toFixed(2)} | Food: ${tile.foodPheromone.toFixed(2)}`
-                    : tile.hasTrail
-                      ? `Trail strength: ${tile.trailStrength.toFixed(2)}`
-                      : "Unknown"
-                }
-              >
-                {display.content}
-              </div>
-            );
-          }),
-        )}
+      {/* Game Canvas */}
+      <div className="rounded-lg overflow-hidden shadow-2xl border-2 border-stone-700">
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_SIZE}
+          height={CANVAS_SIZE}
+          style={{
+            width: `min(${CANVAS_SIZE}px, 90vw)`,
+            height: `min(${CANVAS_SIZE}px, 90vw)`,
+            imageRendering: "pixelated",
+          }}
+        />
       </div>
 
       {/* Speed & Pause Controls */}
@@ -851,49 +1154,41 @@ const Home: NextPage = () => {
       </div>
 
       {/* Legend */}
-      <div className="mt-6 text-xs text-amber-200/60 max-w-md flex flex-wrap justify-center gap-3">
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-4 h-4 rounded" style={{ backgroundColor: "#5d4037" }}>
-            🏠
-          </span>{" "}
-          Nest
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-4 h-4 rounded" style={{ backgroundColor: "#4e342e" }}>
-            🐜
-          </span>{" "}
-          Ant
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-4 h-4 rounded" style={{ backgroundColor: "#33691e" }}>
-            🍎
-          </span>{" "}
-          Food
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-4 h-4 rounded" style={{ backgroundColor: "#b71c1c" }}>
-            ☠️
-          </span>{" "}
-          Danger
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-4 h-4 rounded" style={{ backgroundColor: "#4e342e" }}></span> Fog
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-4 h-4 rounded" style={{ backgroundColor: "rgba(255,255,255,0.5)" }}></span>{" "}
-          Outgoing trail
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-4 h-4 rounded" style={{ backgroundColor: "rgba(46,125,50,0.6)" }}></span> Food
-          route
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="inline-block w-4 h-4 rounded" style={{ backgroundColor: "#a1887f" }}></span> Explored
-        </span>
+      <div className="mt-6 text-xs text-amber-200/60 max-w-lg">
+        <div className="flex flex-wrap justify-center gap-4">
+          <span className="flex items-center gap-2">
+            <span className="w-4 h-4 rounded-full bg-amber-700 border border-amber-600"></span>
+            Nest
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="w-4 h-4 rounded-full bg-stone-900 border border-stone-600"></span>
+            Ant
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="w-4 h-4 rounded-full bg-red-500"></span>
+            Food
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="w-4 h-4 rounded-full bg-stone-900 border border-red-500"></span>
+            Spider
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="w-4 h-4 rounded bg-stone-800"></span>
+            Fog
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="w-4 h-4 rounded" style={{ background: "linear-gradient(90deg, #FF6B6B, #4ECDC4)" }}></span>
+            Ant trails
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="w-4 h-4 rounded bg-green-600/60"></span>
+            Food route
+          </span>
+        </div>
       </div>
 
       <p className="mt-4 text-amber-200/40 text-xs">
-        Tip: If ants go out and don&apos;t come back, something got them. The silence is your only warning.
+        Tip: Each ant leaves a unique colored trail. Watch them explore and discover food!
       </p>
     </div>
   );
